@@ -15,6 +15,73 @@ use super::{ike_keys::ChildSaSecretPair, transport::UdpSocketDatagramTransport};
 const IMS_ESP_CLIENT_FLOW: &str = "client_flow";
 const IMS_ESP_SERVER_FLOW: &str = "server_flow";
 
+/// Polymorphic ESP transport — either a direct UDP socket or a SOCKS5 relay.
+#[derive(Clone)]
+pub(crate) enum EspTransport {
+    Direct(UdpSocketDatagramTransport),
+    Socks5 {
+        client: std::sync::Arc<super::socks5::Socks5UdpClient>,
+        remote: SocketAddr,
+    },
+}
+
+impl EspTransport {
+    pub async fn send_esp_nat_t_metadata(
+        &self,
+        remote: SocketAddr,
+        frame: &[u8],
+    ) -> Result<(), super::transport::TransportError> {
+        match self {
+            EspTransport::Direct(transport) => {
+                transport.send_esp_nat_t_metadata(remote, frame).await.map(|_| ())
+            }
+            EspTransport::Socks5 { client, .. } => {
+                // NAT-T ESP: prepend 4 zero bytes (non-ESP marker already in frame for NAT-T)
+                client
+                    .send_to(remote, frame)
+                    .await
+                    .map_err(|err| {
+                        super::transport::TransportError::Io(format!(
+                            "socks5_esp_send: {err}"
+                        ))
+                    })
+            }
+        }
+    }
+
+    pub async fn recv_nat_t_raw_metadata(
+        &self,
+    ) -> Result<(SocketAddr, Vec<u8>, ()), super::transport::TransportError> {
+        match self {
+            EspTransport::Direct(transport) => transport.recv_nat_t_raw_metadata().await.map(|(a, d, _)| (a, d, ())),
+            EspTransport::Socks5 { client, remote } => {
+                let (origin, data) = client.recv_from().await.map_err(|err| {
+                    if err.to_string().contains("timeout") {
+                        super::transport::TransportError::Timeout(
+                            "socks5_esp_recv_timeout".to_string(),
+                        )
+                    } else {
+                        super::transport::TransportError::Io(format!(
+                            "socks5_esp_recv: {err}"
+                        ))
+                    }
+                })?;
+                Ok((origin.unwrap_or(*remote), data, ()))
+            }
+        }
+    }
+
+    pub fn with_recv_timeout(self, timeout: std::time::Duration) -> Self {
+        match self {
+            EspTransport::Direct(transport) => EspTransport::Direct(transport.with_recv_timeout(timeout)),
+            EspTransport::Socks5 { client, remote } => {
+                // Socks5UdpClient already has its own recv_timeout set at construction
+                EspTransport::Socks5 { client, remote }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TunGatewayConfig {
     pub profile_id: &'static str,
@@ -26,7 +93,7 @@ pub(crate) struct TunGatewayConfig {
     pub inbound_sa_identifier: u32,
     pub outbound_sa_identifier: u32,
     pub secrets: ChildSaSecretPair,
-    pub transport: UdpSocketDatagramTransport,
+    pub transport: EspTransport,
     pub remote: SocketAddr,
 }
 
@@ -579,7 +646,7 @@ mod imp {
                 }
                 let packet = match inbound_transport.recv_nat_t_raw_metadata().await {
                     Ok((_remote, packet, _metadata)) => packet,
-                    Err(super::super::transport::TransportError::Timeout(_)) => continue,
+                    Err(crate::connectivity::modems::softstack::vowifi::transport::TransportError::Timeout(_)) => continue,
                     Err(err) => {
                         warn!(reason = %err, "VoWiFi ESP inbound receive failed");
                         continue;

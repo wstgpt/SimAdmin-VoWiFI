@@ -1341,7 +1341,7 @@ enum LiveIkeTarget {
 
 struct LiveIkeSession {
     child_sa: Option<LiveChildSaMaterial>,
-    transport: Option<UdpSocketDatagramTransport>,
+    transport: Option<tun_gateway::EspTransport>,
     remote: Option<SocketAddr>,
 }
 
@@ -1425,6 +1425,266 @@ async fn run_live_ike_until(
     target: LiveIkeTarget,
 ) -> Result<LiveIkeSession, LiveStageError> {
     run_live_ike_until_depth(line_id, profile, target, LiveProbeDepth::FullHandshake).await
+}
+
+/// Continue the IKE_AUTH EAP-AKA exchange through a SOCKS5 UDP ASSOCIATE relay.
+///
+/// This is called after IKE_SA_INIT has completed via SOCKS5 and the first
+/// IKE_AUTH response has been received. It drives the multi-round EAP-AKA
+/// challenge/response cycle and the final IKE_AUTH completion.
+#[allow(clippy::too_many_arguments)]
+async fn run_live_ike_eap_aka_via_socks5(
+    line_id: &str,
+    _profile: &'static CarrierProfile,
+    machine: &mut IkeStateMachine,
+    socks_client: &super::socks5::Socks5UdpClient,
+    socks_client_arc: std::sync::Arc<super::socks5::Socks5UdpClient>,
+    ike_destination: SocketAddr,
+    use_nat_t: bool,
+    first_auth_response: &[u8],
+    initiator_spi: u64,
+) -> Result<LiveIkeSession, LiveStageError> {
+    use crate::connectivity::modems::softstack::vowifi::eap_aka::{
+        build_challenge_response, build_sync_failure_response, parse_challenge,
+    };
+
+    info!("EAP-AKA via SOCKS5: validating initial IKE_AUTH response...");
+    validate_ike_auth_response(first_auth_response, initiator_spi, 1)?;
+    machine
+        .accept_encrypted_eap_aka_challenge_reason(first_auth_response)
+        .map_err(|reason| {
+            error!("EAP-AKA challenge accept failed (SOCKS5): {}", reason);
+            LiveStageError { reason }
+        })?;
+
+    info!("Decrypting EAP-AKA challenge (SOCKS5)...");
+    let eap_challenge = machine
+        .decrypted_eap_aka_challenge_packet(first_auth_response)
+        .map_err(|_| live_stage_error("ike_auth_eap_challenge_decode_failed"))?;
+    let challenge = parse_challenge(&eap_challenge)
+        .map_err(|_| live_stage_error("eap_aka_challenge_parse_failed"))?;
+
+    info!("Spawning USIM Authentication via QMI proxy (SOCKS5 path)...");
+    let proxy_socket = live_runtime_config().qmi_proxy_socket;
+    let sim_device = sim_device_for_line(line_id);
+    let aka_result = tokio::task::spawn_blocking({
+        let rand = challenge.rand.clone();
+        let autn = challenge.autn.clone();
+        move || {
+            execute_usim_authenticate_via_proxy_reason_with_retry(
+                proxy_socket.as_str(),
+                sim_device.qmi_device.as_str(),
+                sim_device.uim_slot,
+                USIM_AID_PREFIX,
+                &rand,
+                &autn,
+                LIVE_SIM_AUTH_ATTEMPTS,
+                LIVE_SIM_AUTH_TIMEOUT,
+                LIVE_SIM_AUTH_RETRY_DELAY,
+            )
+        }
+    })
+    .await
+    .map_err(|_| live_stage_error("sim_auth_runtime_failed"))?
+    .map_err(|reason| {
+        error!("USIM Authentication failed (SOCKS5 path): {}", reason);
+        live_stage_error(reason)
+    })?;
+    info!(
+        "USIM Authentication succeeded (SOCKS5), auts present: {}",
+        aka_result.auts.is_some()
+    );
+
+    let identity = live_ike_identity(line_id, _profile).await?;
+    let mut eap_response = if let Some(auts) = aka_result.auts.as_deref() {
+        build_sync_failure_response(&challenge, auts)
+            .map_err(|_| live_stage_error("eap_aka_response_build_failed"))?
+    } else {
+        build_challenge_response(&challenge, &identity, &aka_result)
+            .map_err(|_| live_stage_error("eap_aka_response_build_failed"))?
+    };
+    let eap_response_packet = machine
+        .build_encrypted_eap_response_packet(eap_response.expose_for_ike_encryption())
+        .map_err(|_| live_stage_error("ike_auth_eap_response_encrypt_failed"))?;
+
+    info!("Sending EAP-AKA response via SOCKS5 to {:?}", ike_destination);
+    socks5_send(socks_client, ike_destination, use_nat_t, &eap_response_packet).await?;
+    let mut last_auth_request = eap_response_packet;
+
+    let mut success_includes_child_sa = false;
+    for loop_idx in 0..5u8 {
+        let expected_message_id = machine.next_message_id().saturating_sub(1);
+        debug!("EAP progress loop {} (SOCKS5), expected_msg_id={}", loop_idx, expected_message_id);
+
+        let auth_progress_response = socks5_recv_with_retransmit(
+            socks_client,
+            ike_destination,
+            use_nat_t,
+            &last_auth_request,
+            "ike_auth_progress_timeout",
+            LIVE_IKE_AUTH_ATTEMPTS,
+        )
+        .await?;
+
+        validate_ike_auth_response(&auth_progress_response, initiator_spi, expected_message_id)?;
+        match machine
+            .accept_encrypted_auth_progress_or_reason(&auth_progress_response)
+            .map_err(|reason| {
+                error!("EAP progress accept failed (SOCKS5): {}", reason);
+                LiveStageError { reason }
+            })? {
+            IkeAuthProgress::EapAkaIdentity { packet } => {
+                info!("Received EapAkaIdentity request (SOCKS5)");
+                eap_response = eap_response
+                    .identity_response(&packet, &identity)
+                    .map_err(|_| live_stage_error("eap_aka_identity_response_build_failed"))?;
+                let pkt = machine
+                    .build_encrypted_eap_response_packet(eap_response.expose_for_ike_encryption())
+                    .map_err(|_| live_stage_error("ike_auth_eap_identity_encrypt_failed"))?;
+                socks5_send(socks_client, ike_destination, use_nat_t, &pkt).await?;
+                last_auth_request = pkt;
+            }
+            IkeAuthProgress::EapSuccess { child_sa_included } => {
+                info!("Received EapSuccess (SOCKS5), child_sa_included={}", child_sa_included);
+                success_includes_child_sa = child_sa_included;
+                break;
+            }
+            IkeAuthProgress::EapAkaNotification { packet } => {
+                info!("Received EapAkaNotification (SOCKS5)");
+                eap_response = eap_response
+                    .notification_response(&packet)
+                    .map_err(|_| live_stage_error("eap_aka_notification_response_build_failed"))?;
+                let pkt = machine
+                    .build_encrypted_eap_response_packet(eap_response.expose_for_ike_encryption())
+                    .map_err(|_| live_stage_error("ike_auth_eap_notification_encrypt_failed"))?;
+                socks5_send(socks_client, ike_destination, use_nat_t, &pkt).await?;
+                last_auth_request = pkt;
+            }
+        }
+    }
+
+    if machine.snapshot().phase != "auth_success_accepted"
+        && machine.snapshot().phase != "child_sa_ready"
+    {
+        error!("EAP-AKA success not reached (SOCKS5). Phase: {}", machine.snapshot().phase);
+        return Err(live_stage_error("eap_aka_success_not_reached"));
+    }
+
+    if !success_includes_child_sa {
+        info!("Building final IKE_AUTH request (SOCKS5)...");
+        let msk = eap_response
+            .msk_for_ike_auth()
+            .ok_or_else(|| live_stage_error("eap_aka_msk_unavailable"))?;
+        let expected_message_id = machine.next_message_id();
+        let final_auth_packet = machine
+            .build_encrypted_final_auth_packet(msk)
+            .map_err(|_| live_stage_error("ike_auth_final_request_build_failed"))?;
+        info!("Sending final IKE_AUTH via SOCKS5 to {:?}", ike_destination);
+        socks5_send(socks_client, ike_destination, use_nat_t, &final_auth_packet).await?;
+        let child_sa_response = socks5_recv_with_retransmit(
+            socks_client,
+            ike_destination,
+            use_nat_t,
+            &final_auth_packet,
+            "ike_child_sa_timeout",
+            LIVE_IKE_AUTH_ATTEMPTS,
+        )
+        .await?;
+        info!("Received final IKE_AUTH response (SOCKS5)");
+        validate_ike_auth_response(&child_sa_response, initiator_spi, expected_message_id)?;
+        machine
+            .accept_encrypted_child_sa_response_or_reason(&child_sa_response)
+            .map_err(|reason| LiveStageError { reason })?;
+    }
+
+    info!("IKE session fully established via SOCKS5 proxy!");
+    Ok(LiveIkeSession {
+        child_sa: machine
+            .child_sa_material()
+            .map(|material| LiveChildSaMaterial {
+                inbound_sa_identifier: material.inbound_sa_identifier,
+                outbound_sa_identifier: material.outbound_sa_identifier,
+                selected_profile_proposal: material.selected_profile_proposal,
+                configuration: material.configuration.clone(),
+                secrets: material.secrets.clone(),
+            }),
+        transport: Some(tun_gateway::EspTransport::Socks5 {
+            client: socks_client_arc,
+            remote: ike_destination,
+        }),
+        remote: Some(ike_destination),
+    })
+}
+
+/// Send a packet via SOCKS5 with NAT-T framing.
+async fn socks5_send(
+    client: &super::socks5::Socks5UdpClient,
+    destination: SocketAddr,
+    nat_t: bool,
+    payload: &[u8],
+) -> Result<(), LiveStageError> {
+    let data = if nat_t {
+        let mut frame = vec![0u8; 4 + payload.len()];
+        frame[4..].copy_from_slice(payload);
+        frame
+    } else {
+        payload.to_vec()
+    };
+    client
+        .send_to(destination, &data)
+        .await
+        .map_err(|err| live_stage_error(format!("socks5_send_failed:{err}")))?;
+    Ok(())
+}
+
+/// Receive a packet via SOCKS5 with retransmit, stripping NAT-T framing.
+async fn socks5_recv_with_retransmit(
+    client: &super::socks5::Socks5UdpClient,
+    destination: SocketAddr,
+    nat_t: bool,
+    last_request: &[u8],
+    timeout_reason: &str,
+    max_attempts: usize,
+) -> Result<Vec<u8>, LiveStageError> {
+    let send_data = if nat_t {
+        let mut frame = vec![0u8; 4 + last_request.len()];
+        frame[4..].copy_from_slice(last_request);
+        frame
+    } else {
+        last_request.to_vec()
+    };
+
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            // Retransmit
+            client
+                .send_to(destination, &send_data)
+                .await
+                .map_err(|err| live_stage_error(format!("socks5_retransmit_failed:{err}")))?;
+        }
+        match tokio::time::timeout(LIVE_IKE_AUTH_TIMEOUT, client.recv_from()).await {
+            Ok(Ok((_, data))) => {
+                let payload = if nat_t && data.len() > 4 && data[..4] == [0, 0, 0, 0] {
+                    data[4..].to_vec()
+                } else {
+                    data
+                };
+                return Ok(payload);
+            }
+            Ok(Err(err)) => {
+                warn!("SOCKS5 recv error (attempt {}): {}", attempt + 1, err);
+                if attempt + 1 >= max_attempts {
+                    return Err(live_stage_error(format!("socks5_recv_failed:{err}")));
+                }
+            }
+            Err(_) => {
+                if attempt + 1 >= max_attempts {
+                    return Err(live_stage_error(timeout_reason));
+                }
+            }
+        }
+    }
+    Err(live_stage_error(timeout_reason))
 }
 
 async fn run_live_ike_until_depth(
@@ -1513,6 +1773,185 @@ async fn run_live_ike_with_destination(
     path: LiveIkeTransportPath,
     proposal_group: &LiveIkeProposalGroup,
 ) -> Result<LiveIkeSession, LiveStageError> {
+    // Check if this line has a SOCKS5 proxy configured for IKE traffic.
+    let overrides = line_overrides(line_id);
+    let proxy_endpoint = match &overrides.proxy {
+        Some(LiveProxySetting::Socks5(ep)) => Some(ep.clone()),
+        None => None,
+    };
+
+    if let Some(ref endpoint) = proxy_endpoint {
+        // ── SOCKS5 UDP ASSOCIATE path ──
+        info!(
+            "run_live_ike_with_destination (SOCKS5): proxy={}:{} destination={:?}",
+            endpoint.host,
+            endpoint.port,
+            destination
+        );
+        let socks_client = super::socks5::Socks5UdpClient::connect(
+            endpoint,
+            destination.ip(),
+            Duration::from_secs(8),
+        )
+        .await
+        .map_err(|err| live_stage_error(format!("ike_socks5_connect_failed:{err}")))?;
+        let socks_client = socks_client
+            .with_recv_timeout(LIVE_IKE_SA_INIT_TIMEOUT)
+            .with_max_datagram_bytes(8192);
+
+        let initiator_spi = generate_initiator_spi()?;
+        let initiator_nonce = generate_nonce()?;
+        debug!(
+            nonce_len = initiator_nonce.len(),
+            "Generated IKE initiator nonce metadata (SOCKS5)"
+        );
+        let dh = Modp2048Ephemeral::generate_for_group(proposal_group.dh_group)
+            .map_err(|_| live_stage_error("ike_dh_material_unavailable"))?;
+        let mut machine = IkeStateMachine::new_with_dh_group(
+            profile,
+            initiator_spi,
+            initiator_nonce,
+            dh.public_value().to_vec(),
+            proposal_group.dh_group.transform_id(),
+        );
+        // For SOCKS5, use the local relay socket address as "our" address.
+        let local_addr = socks_client
+            .local_addr()
+            .map_err(|err| live_stage_error(format!("ike_socks5_local_addr:{err}")))?;
+        let request = machine
+            .build_sa_init_request_for_addresses_with_proposals(
+                local_addr,
+                destination,
+                &proposal_group.proposals,
+            )
+            .map_err(|_| live_stage_error("ike_sa_init_request_build_failed"))?
+            .encode()
+            .map_err(|_| live_stage_error("ike_sa_init_request_encode_failed"))?;
+
+        info!(
+            "Sending IKE_SA_INIT via SOCKS5 to destination={:?}, len={}, initial_nat_t={}",
+            destination,
+            request.len(),
+            path.initial_nat_t
+        );
+        let send_data = if path.initial_nat_t {
+            let mut frame = vec![0u8; 4 + request.len()];
+            frame[4..].copy_from_slice(&request);
+            frame
+        } else {
+            request.clone()
+        };
+        socks_client
+            .send_to(destination, &send_data)
+            .await
+            .map_err(|err| live_stage_error(format!("ike_socks5_send_failed:{err}")))?;
+
+        // Receive response via SOCKS5
+        let response = tokio::time::timeout(
+            LIVE_IKE_SA_INIT_TIMEOUT * (LIVE_IKE_SA_INIT_ATTEMPTS as u32 + 1),
+            socks_client.recv_from(),
+        )
+        .await
+        .map_err(|_| live_stage_error(path.timeout_reason))?
+        .map_err(|err| live_stage_error(format!("ike_socks5_recv_failed:{err}")))?;
+        let (_, response_data) = response;
+        // Strip NAT-T marker (4 zero bytes) if present.
+        let response_payload = if path.initial_nat_t && response_data.len() > 4 && response_data[..4] == [0, 0, 0, 0] {
+            &response_data[4..]
+        } else {
+            &response_data
+        };
+
+        info!("Received IKE_SA_INIT response via SOCKS5, parsing...");
+        if let Err(err) = machine.accept_sa_init_response(response_payload) {
+            warn!("IKE_SA_INIT response rejected (SOCKS5): {:?}", err);
+            return Err(live_stage_error("ike_sa_init_response_rejected"));
+        }
+        info!("IKE_SA_INIT response parsed successfully (SOCKS5)");
+        if target == LiveIkeTarget::SaInitReady {
+            return Ok(LiveIkeSession {
+                child_sa: None,
+                transport: None,
+                remote: Some(destination),
+            });
+        }
+        let mut ike_destination = destination;
+        let use_nat_t = path.initial_nat_t || machine.nat_t_supported();
+        if use_nat_t {
+            ike_destination.set_port(IKE_NAT_T_PORT);
+        }
+        info!(
+            "IKE_AUTH destination port set to: {} (use_nat_t={}) [SOCKS5]",
+            ike_destination.port(),
+            use_nat_t
+        );
+        let shared_secret = dh
+            .shared_secret(
+                machine
+                    .responder_public_dh()
+                    .ok_or_else(|| live_stage_error("ike_sa_init_missing_peer_dh"))?,
+            )
+            .map_err(|_| live_stage_error("ike_dh_shared_secret_failed"))?;
+        debug!("Shared secret computed successfully (SOCKS5)");
+        machine
+            .derive_session_keys(&shared_secret)
+            .map_err(|_| live_stage_error("ike_session_key_derivation_failed"))?;
+        let identity = live_ike_identity(line_id, profile).await?;
+        info!(
+            identity_len = identity.len(),
+            "Resolved NAI identity for IKE_AUTH (SOCKS5)"
+        );
+        let auth_packet = machine
+            .build_auth_eap_start_packet_for_identity(&identity)
+            .map_err(|_| live_stage_error("ike_auth_request_build_failed"))?;
+        info!(
+            "Sending IKE_AUTH EAP start request via SOCKS5 to {:?}",
+            ike_destination
+        );
+        let auth_send_data = if use_nat_t {
+            let mut frame = vec![0u8; 4 + auth_packet.len()];
+            frame[4..].copy_from_slice(&auth_packet);
+            frame
+        } else {
+            auth_packet.clone()
+        };
+        socks_client
+            .send_to(ike_destination, &auth_send_data)
+            .await
+            .map_err(|err| live_stage_error(format!("ike_socks5_auth_send_failed:{err}")))?;
+        let auth_response = tokio::time::timeout(
+            LIVE_IKE_AUTH_TIMEOUT,
+            socks_client.recv_from(),
+        )
+        .await
+        .map_err(|_| live_stage_error("ike_auth_eap_start_timeout"))?
+        .map_err(|err| live_stage_error(format!("ike_socks5_auth_recv_failed:{err}")))?;
+        let (_, auth_response_data) = auth_response;
+        let auth_response_payload = if use_nat_t && auth_response_data.len() > 4 && auth_response_data[..4] == [0, 0, 0, 0] {
+            auth_response_data[4..].to_vec()
+        } else {
+            auth_response_data
+        };
+        info!("Received IKE_AUTH response via SOCKS5, proceeding with EAP-AKA...");
+        // Wrap client in Arc for shared ownership with the ESP transport
+        let socks_client_arc = std::sync::Arc::new(socks_client);
+        // Continue with EAP-AKA exchange via SOCKS5
+        let session = run_live_ike_eap_aka_via_socks5(
+            line_id,
+            profile,
+            &mut machine,
+            &socks_client_arc,
+            socks_client_arc.clone(),
+            ike_destination,
+            use_nat_t,
+            &auth_response_payload,
+            initiator_spi,
+        )
+        .await?;
+        return Ok(session);
+    }
+
+    // ── Direct UDP path (no proxy) ──
     let local_addr = local_bind_addr_for_destination(destination, path.preferred_local_port)
         .await
         .unwrap_or_else(|_| unspecified_local_addr_for(destination));
@@ -1580,7 +2019,7 @@ async fn run_live_ike_with_destination(
     if target == LiveIkeTarget::SaInitReady {
         return Ok(LiveIkeSession {
             child_sa: None,
-            transport: Some(transport.clone()),
+            transport: Some(tun_gateway::EspTransport::Direct(transport.clone())),
             remote: Some(destination),
         });
     }
@@ -1822,7 +2261,7 @@ async fn run_live_ike_with_destination(
                 configuration: material.configuration.clone(),
                 secrets: material.secrets.clone(),
             }),
-        transport: Some(auth_transport.clone()),
+        transport: Some(tun_gateway::EspTransport::Direct(auth_transport.clone())),
         remote: Some(ike_destination),
     })
 }

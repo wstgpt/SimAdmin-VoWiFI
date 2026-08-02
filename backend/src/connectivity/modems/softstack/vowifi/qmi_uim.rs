@@ -13,6 +13,7 @@ const QMUX_UIM_SERVICE: u8 = 0x0b;
 const QMI_CTL_ALLOCATE_CID: u16 = 0x0022;
 const QMI_CTL_RELEASE_CID: u16 = 0x0023;
 const QMI_PROXY_OPEN: u16 = 0xff00;
+const QMI_UIM_GET_CARD_STATUS: u16 = 0x002f;
 const QMI_UIM_SEND_APDU: u16 = 0x003b;
 const QMI_UIM_OPEN_LOGICAL_CHANNEL: u16 = 0x0042;
 const QMI_UIM_LOGICAL_CHANNEL: u16 = 0x003f;
@@ -152,6 +153,203 @@ pub fn parse_allocated_cid(message: &QmiMessage) -> Result<u8, QmiUimError> {
         return Err(QmiUimError::InvalidFrame);
     }
     Ok(value[1])
+}
+
+/// Build a QMI UIM GET_CARD_STATUS request frame.
+pub fn build_get_card_status_frame(
+    client_id: u8,
+    transaction_id: u16,
+) -> Result<Vec<u8>, QmiUimError> {
+    encode_qmi_message(&QmiMessage {
+        service: QMUX_UIM_SERVICE,
+        client_id,
+        transaction_id,
+        message_id: QMI_UIM_GET_CARD_STATUS,
+        tlvs: vec![],
+    })
+}
+
+/// Parse the QMI UIM GET_CARD_STATUS response to extract the full AID for the
+/// first USIM application on the given slot. Returns the complete Application ID
+/// bytes (typically 16 bytes for USIM).
+///
+/// The response TLV 0x10 (Card Status) has a complex nested structure:
+///   - Offset 0: index_gw_pri (2 bytes LE)
+///   - Offset 2: index_1x_pri (2 bytes LE)
+///   - Offset 4: index_gw_sec (2 bytes LE)
+///   - Offset 6: index_1x_sec (2 bytes LE)
+///   - Offset 8: num_slots (1 byte)
+///   - For each slot:
+///     - card_state (1 byte)
+///     - upin_state (1 byte), upin_retries (1 byte), upuk_retries (1 byte)
+///     - num_apps (1 byte)
+///     - For each app:
+///       - app_type (1 byte): 1=SIM, 2=USIM, 3=RUIM, 4=CSIM, 5=ISIM
+///       - app_state (1 byte)
+///       - perso_state (1 byte)
+///       - perso_feature (1 byte), perso_retries (1 byte), perso_unblock_retries (1 byte)
+///       - aid_len (1 byte), aid_value (aid_len bytes)
+///       - upin (1 byte)
+///       - pin1_state (1 byte), pin1_retries (1 byte), puk1_retries (1 byte)
+///       - pin2_state (1 byte), pin2_retries (1 byte), puk2_retries (1 byte)
+pub fn parse_card_status_usim_aid(
+    message: &QmiMessage,
+    target_slot: u8,
+    aid_prefix: &[u8],
+) -> Result<Vec<u8>, QmiUimError> {
+    ensure_success(message)?;
+    // TLV 0x10 contains the card status
+    let value = find_tlv(message, 0x10).ok_or(QmiUimError::MissingTlv("card_status"))?;
+    if value.len() < 9 {
+        return Err(QmiUimError::InvalidFrame);
+    }
+    // Skip provisioning indices (8 bytes) to get num_slots
+    let mut offset = 8;
+    let num_slots = *value.get(offset).ok_or(QmiUimError::InvalidFrame)?;
+    offset += 1;
+
+    for slot_idx in 0..num_slots {
+        if offset + 4 >= value.len() {
+            return Err(QmiUimError::InvalidFrame);
+        }
+        let _card_state = value[offset];
+        offset += 1; // card_state
+        offset += 3; // upin_state, upin_retries, upuk_retries
+
+        let num_apps = *value.get(offset).ok_or(QmiUimError::InvalidFrame)?;
+        offset += 1;
+
+        for _app_idx in 0..num_apps {
+            if offset + 6 >= value.len() {
+                return Err(QmiUimError::InvalidFrame);
+            }
+            let app_type = value[offset];
+            offset += 1; // app_type
+            offset += 1; // app_state
+            offset += 1; // perso_state
+            offset += 1; // perso_feature
+            offset += 1; // perso_retries
+            offset += 1; // perso_unblock_retries
+
+            let aid_len = *value.get(offset).ok_or(QmiUimError::InvalidFrame)? as usize;
+            offset += 1;
+
+            if offset + aid_len > value.len() {
+                return Err(QmiUimError::InvalidFrame);
+            }
+            let aid_bytes = &value[offset..offset + aid_len];
+            offset += aid_len;
+
+            // upin + pin1 (3 bytes) + pin2 (3 bytes) = 7 bytes
+            if offset + 7 > value.len() {
+                return Err(QmiUimError::InvalidFrame);
+            }
+            offset += 7; // upin, pin1_state/retries/puk, pin2_state/retries/puk
+
+            // Check if this is the target slot and a matching application
+            // slot_idx is 0-based, target_slot is 1-based
+            if (slot_idx + 1) == target_slot
+                && (app_type == 2 || app_type == 5) // USIM=2, ISIM=5
+                && aid_len >= aid_prefix.len()
+                && aid_bytes[..aid_prefix.len()] == *aid_prefix
+            {
+                return Ok(aid_bytes.to_vec());
+            }
+        }
+    }
+
+    Err(QmiUimError::MissingTlv("usim_application_aid"))
+}
+
+/// Resolve the full AID for the USIM application on the given slot by querying
+/// QMI UIM GET_CARD_STATUS. Falls back to shelling out to `qmicli` if the raw
+/// QMI parsing fails, and ultimately to the prefix if all else fails.
+pub fn resolve_full_usim_aid(
+    proxy_socket: &str,
+    device_path: &str,
+    slot: u8,
+    aid_prefix: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
+    #[cfg(not(unix))]
+    {
+        let _ = (proxy_socket, device_path, slot, aid_prefix, timeout);
+        return aid_prefix.to_vec();
+    }
+
+    #[cfg(unix)]
+    {
+        // Strategy 1: Try raw QMI GET_CARD_STATUS
+        let qmi_result = (|| -> Result<Vec<u8>, QmiUimError> {
+            let mut conn = QmiProxyConnection::connect(proxy_socket, timeout)?;
+            conn.proxy_open(device_path)?;
+            let client_id = conn.allocate_uim_cid()?;
+            let full_aid = conn.get_card_status_usim_aid(client_id, slot, aid_prefix);
+            let _ = conn.release_uim_cid(client_id);
+            full_aid
+        })();
+        match &qmi_result {
+            Ok(aid) if aid.len() > aid_prefix.len() => {
+                tracing::info!(
+                    aid_len = aid.len(),
+                    "resolve_full_usim_aid: QMI GET_CARD_STATUS succeeded"
+                );
+                return aid.clone();
+            }
+            Ok(aid) => {
+                tracing::warn!(
+                    aid_len = aid.len(),
+                    prefix_len = aid_prefix.len(),
+                    "resolve_full_usim_aid: QMI returned AID not longer than prefix, trying qmicli"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "resolve_full_usim_aid: QMI GET_CARD_STATUS failed, trying qmicli fallback"
+                );
+            }
+        }
+
+        // Strategy 2: Shell out to qmicli and parse the Application ID
+        tracing::info!("resolve_full_usim_aid: attempting qmicli fallback for device={}", device_path);
+        if let Ok(output) = std::process::Command::new("qmicli")
+            .args(["-d", device_path, "-p", "--uim-get-card-status"])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Look for "Application ID:" line and parse the hex AID
+                // Format: "\t\t\tA0:00:00:00:87:10:02:FF:44:FF:12:89:00:00:01:00"
+                let mut found_aid_header = false;
+                for line in stdout.lines() {
+                    if line.contains("Application ID:") {
+                        found_aid_header = true;
+                        continue;
+                    }
+                    if found_aid_header {
+                        let trimmed = line.trim();
+                        if trimmed.contains(':') {
+                            // Parse hex bytes like "A0:00:00:00:87:10:02:..."
+                            let bytes: Vec<u8> = trimmed
+                                .split(':')
+                                .filter_map(|hex| u8::from_str_radix(hex, 16).ok())
+                                .collect();
+                            if bytes.len() >= aid_prefix.len()
+                                && bytes[..aid_prefix.len()] == *aid_prefix
+                            {
+                                return bytes;
+                            }
+                        }
+                        found_aid_header = false;
+                    }
+                }
+            }
+        }
+
+        // Fallback: use prefix (will likely fail on basebands that require full AID)
+        aid_prefix.to_vec()
+    }
 }
 
 pub fn build_open_logical_channel_frame(
@@ -352,10 +550,12 @@ pub fn execute_usim_authenticate_via_proxy(
 
     #[cfg(unix)]
     {
+        let full_aid = resolve_full_aid_via_qmicli(device_path, aid);
+        let effective_aid = if full_aid.len() > aid.len() { &full_aid } else { aid };
         let mut conn = QmiProxyConnection::connect(proxy_socket, timeout)?;
         conn.proxy_open(device_path)?;
         let client_id = conn.allocate_uim_cid()?;
-        let channel = conn.open_logical_channel(client_id, slot, aid)?;
+        let channel = conn.open_logical_channel(client_id, slot, effective_aid)?;
         let apdu = build_usim_authenticate_apdu(rand, autn)?;
         let response = conn.send_apdu(client_id, slot, channel.channel_id, &apdu);
         let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
@@ -381,6 +581,9 @@ pub fn execute_usim_authenticate_via_proxy_reason(
 
     #[cfg(unix)]
     {
+        let full_aid = resolve_full_aid_via_qmicli(device_path, aid);
+        let effective_aid = if full_aid.len() > aid.len() { &full_aid } else { aid };
+
         let mut conn = QmiProxyConnection::connect(proxy_socket, timeout)
             .map_err(|_| "sim_auth_proxy_connect_failed")?;
         conn.proxy_open(device_path)
@@ -388,7 +591,7 @@ pub fn execute_usim_authenticate_via_proxy_reason(
         let client_id = conn
             .allocate_uim_cid()
             .map_err(|_| "sim_auth_uim_client_failed")?;
-        let channel = match conn.open_logical_channel(client_id, slot, aid) {
+        let channel = match conn.open_logical_channel(client_id, slot, effective_aid) {
             Ok(channel) => channel,
             Err(_) => {
                 let _ = conn.release_uim_cid(client_id);
@@ -481,6 +684,9 @@ pub fn verify_usim_application_via_proxy_reason(
 
     #[cfg(unix)]
     {
+        let full_aid = resolve_full_aid_via_qmicli(device_path, aid);
+        let effective_aid = if full_aid.len() > aid.len() { &full_aid } else { aid };
+
         let mut conn = QmiProxyConnection::connect(proxy_socket, timeout)
             .map_err(|_| "sim_auth_proxy_connect_failed")?;
         conn.proxy_open(device_path)
@@ -488,7 +694,7 @@ pub fn verify_usim_application_via_proxy_reason(
         let client_id = conn
             .allocate_uim_cid()
             .map_err(|_| "sim_auth_uim_client_failed")?;
-        let channel = match conn.open_logical_channel(client_id, slot, aid) {
+        let channel = match conn.open_logical_channel(client_id, slot, effective_aid) {
             Ok(channel) => channel,
             Err(_) => {
                 let _ = conn.release_uim_cid(client_id);
@@ -499,6 +705,63 @@ pub fn verify_usim_application_via_proxy_reason(
         let _ = conn.release_uim_cid(client_id);
         Ok(())
     }
+}
+
+/// Resolve the full USIM AID by calling `qmicli --uim-get-card-status` and
+/// parsing the output. This is called before each authentication attempt.
+/// Uses a process-level cache to avoid repeated shell-outs.
+#[cfg(unix)]
+fn resolve_full_aid_via_qmicli(device_path: &str, prefix: &[u8]) -> Vec<u8> {
+    use std::sync::OnceLock;
+    static CACHED_AID: OnceLock<Vec<u8>> = OnceLock::new();
+
+    if let Some(cached) = CACHED_AID.get() {
+        if cached.len() > prefix.len() {
+            return cached.clone();
+        }
+    }
+
+    let aid = resolve_full_aid_via_qmicli_impl(device_path, prefix);
+    if aid.len() > prefix.len() {
+        let _ = CACHED_AID.set(aid.clone());
+    }
+    aid
+}
+
+#[cfg(unix)]
+fn resolve_full_aid_via_qmicli_impl(device_path: &str, prefix: &[u8]) -> Vec<u8> {
+    let output = match std::process::Command::new("qmicli")
+        .args(["-d", device_path, "-p", "--uim-get-card-status"])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return prefix.to_vec(),
+    };
+    if !output.status.success() {
+        return prefix.to_vec();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut found_aid_header = false;
+    for line in stdout.lines() {
+        if line.contains("Application ID:") {
+            found_aid_header = true;
+            continue;
+        }
+        if found_aid_header {
+            let trimmed = line.trim();
+            if trimmed.contains(':') {
+                let bytes: Vec<u8> = trimmed
+                    .split(':')
+                    .filter_map(|hex| u8::from_str_radix(hex.trim(), 16).ok())
+                    .collect();
+                if bytes.len() >= prefix.len() && bytes[..prefix.len()] == *prefix {
+                    return bytes;
+                }
+            }
+            found_aid_header = false;
+        }
+    }
+    prefix.to_vec()
 }
 
 pub fn verify_usim_application_via_proxy_reason_with_retry(
@@ -616,6 +879,21 @@ impl QmiProxyConnection {
             return Err(QmiUimError::InvalidFrame);
         }
         parse_open_logical_channel(&response)
+    }
+
+    fn get_card_status_usim_aid(
+        &mut self,
+        client_id: u8,
+        slot: u8,
+        aid_prefix: &[u8],
+    ) -> Result<Vec<u8>, QmiUimError> {
+        let tx = self.take_service_transaction();
+        let frame = build_get_card_status_frame(client_id, tx)?;
+        let response = self.send_and_recv(&frame)?;
+        if response.message_id != QMI_UIM_GET_CARD_STATUS {
+            return Err(QmiUimError::InvalidFrame);
+        }
+        parse_card_status_usim_aid(&response, slot, aid_prefix)
     }
 
     fn close_logical_channel(
