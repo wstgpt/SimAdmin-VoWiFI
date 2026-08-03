@@ -95,6 +95,7 @@ pub(crate) struct TunGatewayConfig {
     pub secrets: ChildSaSecretPair,
     pub transport: EspTransport,
     pub remote: SocketAddr,
+    pub nat_keepalive_seconds: u16,
 }
 
 pub(crate) struct TunGatewayRuntime {
@@ -717,6 +718,52 @@ mod imp {
                     Err(err) => {
                         warn!(reason = %err, "VoWiFi ESP inbound unprotect failed");
                     }
+                }
+            }
+        });
+
+        // NAT-T keepalive sender: periodically send a single 0xff byte to the ePDG
+        // through the SOCKS5 relay. This serves two purposes:
+        // 1. Keeps the NAT mapping alive (standard IKEv2 NAT-T keepalive, RFC 3948)
+        // 2. Keeps the SOCKS5 UDP ASSOCIATE relay alive (prevents sing-box/proxy
+        //    from garbage-collecting the idle UDP association)
+        let keepalive_transport = config.transport.clone();
+        let keepalive_remote = config.remote;
+        let keepalive_interval = if config.nat_keepalive_seconds > 0 {
+            // Use half the configured NAT-T interval for safety margin
+            std::time::Duration::from_secs((config.nat_keepalive_seconds as u64).min(10))
+        } else {
+            std::time::Duration::from_secs(10)
+        };
+        let keepalive_shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            tracing::info!(
+                interval_secs = keepalive_interval.as_secs(),
+                "NAT-T keepalive sender started"
+            );
+            // Send the first keepalive immediately to prevent the SOCKS5 relay
+            // from being garbage-collected before any UDP traffic flows.
+            if let Err(err) = keepalive_transport
+                .send_esp_nat_t_metadata(keepalive_remote, &[0xff])
+                .await
+            {
+                tracing::warn!(reason = %err, "NAT-T keepalive initial send failed");
+            }
+            let mut interval = tokio::time::interval(keepalive_interval);
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                if keepalive_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                // NAT-T keepalive: single 0xff byte (RFC 3948 §4)
+                if let Err(err) = keepalive_transport
+                    .send_esp_nat_t_metadata(keepalive_remote, &[0xff])
+                    .await
+                {
+                    tracing::warn!(reason = %err, "NAT-T keepalive send failed");
+                } else {
+                    tracing::debug!("NAT-T keepalive sent");
                 }
             }
         });

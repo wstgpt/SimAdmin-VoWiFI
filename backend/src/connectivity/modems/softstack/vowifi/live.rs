@@ -1664,7 +1664,7 @@ async fn socks5_recv_with_retransmit(
         }
         match tokio::time::timeout(LIVE_IKE_AUTH_TIMEOUT, client.recv_from()).await {
             Ok(Ok((_, data))) => {
-                let payload = if nat_t && data.len() > 4 && data[..4] == [0, 0, 0, 0] {
+                let payload = if data.len() > 4 && data[..4] == [0, 0, 0, 0] {
                     data[4..].to_vec()
                 } else {
                     data
@@ -1856,7 +1856,7 @@ async fn run_live_ike_with_destination(
         .map_err(|err| live_stage_error(format!("ike_socks5_recv_failed:{err}")))?;
         let (_, response_data) = response;
         // Strip NAT-T marker (4 zero bytes) if present.
-        let response_payload = if path.initial_nat_t && response_data.len() > 4 && response_data[..4] == [0, 0, 0, 0] {
+        let response_payload = if response_data.len() > 4 && response_data[..4] == [0, 0, 0, 0] {
             &response_data[4..]
         } else {
             &response_data
@@ -1927,7 +1927,7 @@ async fn run_live_ike_with_destination(
         .map_err(|_| live_stage_error("ike_auth_eap_start_timeout"))?
         .map_err(|err| live_stage_error(format!("ike_socks5_auth_recv_failed:{err}")))?;
         let (_, auth_response_data) = auth_response;
-        let auth_response_payload = if use_nat_t && auth_response_data.len() > 4 && auth_response_data[..4] == [0, 0, 0, 0] {
+        let auth_response_payload = if auth_response_data.len() > 4 && auth_response_data[..4] == [0, 0, 0, 0] {
             auth_response_data[4..].to_vec()
         } else {
             auth_response_data
@@ -2355,6 +2355,7 @@ async fn ensure_live_tun_gateway(
         secrets: child_sa.secrets.clone(),
         transport,
         remote,
+        nat_keepalive_seconds: profile.ikev2.nat_keepalive_seconds,
     })
     .await
     .map_err(|error| live_stage_error(error.reason()))?;
