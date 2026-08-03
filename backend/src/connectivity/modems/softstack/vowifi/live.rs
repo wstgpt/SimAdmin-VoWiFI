@@ -1796,7 +1796,7 @@ async fn run_live_ike_with_destination(
         .await
         .map_err(|err| live_stage_error(format!("ike_socks5_connect_failed:{err}")))?;
         let socks_client = socks_client
-            .with_recv_timeout(LIVE_IKE_SA_INIT_TIMEOUT)
+            .with_recv_timeout(Duration::from_secs(300))
             .with_max_datagram_bytes(8192);
 
         let initiator_spi = generate_initiator_spi()?;

@@ -71,11 +71,14 @@ impl EspTransport {
         }
     }
 
-    pub fn with_recv_timeout(self, timeout: std::time::Duration) -> Self {
+    pub fn with_recv_timeout(self, _timeout: std::time::Duration) -> Self {
         match self {
-            EspTransport::Direct(transport) => EspTransport::Direct(transport.with_recv_timeout(timeout)),
+            EspTransport::Direct(transport) => EspTransport::Direct(transport.with_recv_timeout(_timeout)),
             EspTransport::Socks5 { client, remote } => {
-                // Socks5UdpClient already has its own recv_timeout set at construction
+                // SOCKS5 client's recv_timeout is set at creation time (in live.rs).
+                // We use a long timeout (300s) so the UDP socket stays in a blocking
+                // recv state, preventing the proxy from GC-ing the relay due to
+                // inactivity. The NAT-T keepalive sender ensures actual traffic.
                 EspTransport::Socks5 { client, remote }
             }
         }

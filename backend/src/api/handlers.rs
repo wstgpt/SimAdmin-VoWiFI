@@ -6629,8 +6629,74 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
             attempts = workflow.attempts,
             "WiFi Calling auto-restore scheduled"
         );
-        run_vowifi_restore_workflow(app, workflow).await;
+        run_vowifi_restore_workflow(app.clone(), workflow).await;
+
+        // After initial restore completes, start a persistent health watchdog
+        // that checks VoWiFi status every 30 seconds and reconnects if dropped.
+        spawn_vowifi_health_watchdog(app).await;
     });
+}
+
+async fn spawn_vowifi_health_watchdog(app: AppState) {
+    let check_interval = std::time::Duration::from_secs(30);
+    let reconnect_cooldown = std::time::Duration::from_secs(60);
+    let mut last_reconnect = std::time::Instant::now()
+        .checked_sub(reconnect_cooldown)
+        .unwrap_or_else(std::time::Instant::now);
+
+    info!("VoWiFi health watchdog started (check every 30s)");
+
+    loop {
+        tokio::time::sleep(check_interval).await;
+
+        let config = app.config_manager.get_vowifi_config();
+        if !config.feature_enabled || !config.connection_enabled {
+            continue;
+        }
+
+        // Check if any line has VoWiFi enabled
+        let scope = VowifiScope::primary(&app).await;
+        if !scope.is_bound() {
+            continue;
+        }
+
+        let status = scope.status().await;
+        if status.readiness.sms_ready {
+            // All good, connection is alive
+            continue;
+        }
+
+        // Connection is down - check cooldown
+        let now = std::time::Instant::now();
+        if now.duration_since(last_reconnect) < reconnect_cooldown {
+            continue;
+        }
+
+        // Check if line vowifi is enabled in config
+        let line_id = scope.line_id().to_string();
+        let line_profile = app.config_manager.get_line_profile(&line_id);
+        if !line_profile.vowifi.enabled {
+            continue;
+        }
+
+        info!(
+            phase = ?status.phase,
+            "VoWiFi health watchdog: connection dropped, triggering reconnect"
+        );
+        last_reconnect = now;
+
+        // Trigger reconnect (non-blocking, limited attempts)
+        let reconnect_app = app.clone();
+        tokio::spawn(async move {
+            connect_vowifi_with_attempts(
+                &reconnect_app,
+                3,
+                std::time::Duration::from_secs(10),
+                false, // don't fall back to cellular
+            )
+            .await;
+        });
+    }
 }
 
 fn volte_next_retry_at(delay_secs: u64) -> String {
