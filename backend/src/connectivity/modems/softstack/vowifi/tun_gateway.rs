@@ -126,6 +126,13 @@ impl TunGatewayRuntime {
         self.profile_id == profile_id
     }
 
+    /// Whether the gateway's ESP transport is still functional.
+    /// Returns false when the inbound receiver has detected too many consecutive
+    /// failures and signaled shutdown (e.g. SOCKS5 relay died).
+    pub fn is_alive(&self) -> bool {
+        !self.shutdown.load(Ordering::SeqCst)
+    }
+
     pub fn tun_name(&self) -> &str {
         &self.tun_name
     }
@@ -462,6 +469,13 @@ mod imp {
         if name.is_empty() || name.len() >= IFNAMSIZ || !name.bytes().all(valid_ifname_byte) {
             return Err(tun_error("tun_gateway_invalid_name"));
         }
+
+        // Clean up any stale TUN interface with the same name from a previous
+        // session that wasn't properly torn down (e.g. process crash or restart).
+        let _ = std::process::Command::new("ip")
+            .args(["link", "delete", name])
+            .output();
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -640,15 +654,31 @@ mod imp {
         let inbound_shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             let mut replay = AntiReplayWindow::new(64);
+            let mut consecutive_errors: u32 = 0;
+            const MAX_CONSECUTIVE_ERRORS: u32 = 15;
             loop {
                 if inbound_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
                 let packet = match inbound_transport.recv_nat_t_raw_metadata().await {
-                    Ok((_remote, packet, _metadata)) => packet,
+                    Ok((_remote, packet, _metadata)) => {
+                        consecutive_errors = 0;
+                        packet
+                    }
                     Err(crate::connectivity::modems::softstack::vowifi::transport::TransportError::Timeout(_)) => continue,
                     Err(err) => {
-                        warn!(reason = %err, "VoWiFi ESP inbound receive failed");
+                        consecutive_errors += 1;
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            tracing::error!(
+                                consecutive_errors,
+                                "VoWiFi ESP inbound: too many consecutive failures, signaling shutdown for reconnect"
+                            );
+                            inbound_shutdown.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        warn!(reason = %err, consecutive_errors, "VoWiFi ESP inbound receive failed");
+                        // Brief delay before retry to avoid busy-loop on persistent errors
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         continue;
                     }
                 };

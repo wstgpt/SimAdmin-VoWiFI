@@ -351,6 +351,40 @@ impl Socks5UdpClient {
         // IKE retransmits on its own; Nagle would only add latency here.
         let _ = control.set_nodelay(true);
 
+        // Enable TCP keepalive on the control connection to prevent the proxy
+        // from dropping the UDP ASSOCIATE when the connection appears idle.
+        // Without this, sing-box / mihomo may close the relay after idle timeout.
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = control.as_raw_fd();
+            let keepalive: libc::c_int = 1;
+            let keepidle: libc::c_int = 30; // start probes after 30s idle
+            let keepintvl: libc::c_int = 10; // probe every 10s
+            let keepcnt: libc::c_int = 3; // give up after 3 failed probes
+            unsafe {
+                libc::setsockopt(
+                    fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+                    &keepalive as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
+                    &keepidle as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+                    &keepintvl as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+                    &keepcnt as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
         negotiate_auth(&mut control, endpoint, connect_timeout).await?;
 
         // Bind the local UDP socket first so we can tell the proxy where we will

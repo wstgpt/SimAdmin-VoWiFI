@@ -2315,7 +2315,7 @@ async fn cached_tun_gateway_matches(line_id: &str, profile: &'static CarrierProf
         .lock()
         .await
         .get(line_id)
-        .map(|runtime| runtime.is_for_profile(profile.meta.profile_id))
+        .map(|runtime| runtime.is_for_profile(profile.meta.profile_id) && runtime.is_alive())
         .unwrap_or(false)
 }
 
